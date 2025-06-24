@@ -46,6 +46,7 @@ class BaseTokenizer(PreTrainedTokenizer):
         
         self.vocab: Dict[str:int] = {k:i for i, k in enumerate(token_list)}
         self.ids_to_tokens: Dict[int:str] = {v:k for k, v in self.vocab.items()}
+        self.token_max_length = max([len(_) for _ in self.vocab.keys()])
     
     @property
     def vocab_size(self) -> int:
@@ -64,13 +65,12 @@ class BaseTokenizer(PreTrainedTokenizer):
         return "".join(tokens)
     
     def _tokenize(self, text: str, **kwargs) -> list[str]:
-        token_max_length = max([len(_) for _ in self.vocab.keys()])
         result = []
 
         pos = 0
         while pos < len(text):
             is_matched = False
-            for j in range(min(len(text) - pos, token_max_length), 0, -1):
+            for j in range(min(len(text) - pos, self.token_max_length), 0, -1):
                 sub_str = text[pos:pos+j]
                 if sub_str in self.vocab:
                     result.append(sub_str)

@@ -10,12 +10,16 @@ from typing import Optional, Dict, Tuple, List, Union, Unpack, Sequence, Any
 from collections import OrderedDict
 from flash_attn.ops.triton.layer_norm import RMSNorm
 from flash_attn.losses.cross_entropy import CrossEntropyLoss
+from mamba_ssm import Mamba2
+from causal_conv1d import causal_conv1d_fn
 from einops import rearrange
 from itertools import chain
 from transformers.modeling_outputs import ModelOutput
 from dataclasses import dataclass
+from fla.modules import ShortConvolution
 
 from .configuration_vq import VQConfig
+from .VQ import LFQ, OptVQ
 from transformers.modeling_utils import PreTrainedModel
 
 @torch.no_grad()
@@ -50,27 +54,47 @@ def embedding_init(embedding: nn.Embedding, distribution: str='normal') ->None:
     if embedding.padding_idx is not None:
         embedding.weight[embedding.padding_idx].fill_(0)
 
+@torch.no_grad()
+def factorize(num: int):
+    res = []
+    while num % 2 == 0:
+        num //= 2
+        res.append(2)
+    
+    while num % 3 == 0:
+        num //= 3
+        res.append(3)
+    
+    if num != 1: res = [num]
+    
+    res.reverse()
+    return res
+
 @dataclass
 class VQOutput(ModelOutput):
     loss: Optional[torch.Tensor] = None
     reconstruct_loss: Optional[torch.Tensor] = None
     reconstruct_acc: Optional[torch.Tensor] = None
     commit_loss: Optional[torch.Tensor] = None
+    diversity_loss: Optional[torch.Tensor] = None
     codebook_usage: Optional[torch.Tensor] = None
+    codebook_ppl: Optional[torch.Tensor] = None
 
     codebook_emb: Optional[torch.Tensor] = None
     codebook_idx: Optional[torch.LongTensor] = None
 
 
 class Downsample(nn.Module):
-    def __init__(self, config: VQConfig):
+    def __init__(self, config: VQConfig, stride: int):
         super().__init__()
 
         self.config = config
+        self.stride = stride
         self.pre_linear = nn.Linear(config.latent_size, config.latent_size, bias=False)
         self.norm1 = RMSNorm(hidden_size=config.latent_size, eps=config.eps)
+        self.dropout = nn.Dropout(config.dropout)
         self.activation = nn.SiLU()
-        self.conv = nn.Conv1d(config.latent_size, config.latent_size, config.kernel_size, 2, bias=False)
+        self.conv = nn.Conv1d(config.latent_size, config.latent_size, max(config.kernel_size, stride), stride, bias=False)
         self.norm2 = RMSNorm(hidden_size=config.latent_size, eps=config.eps)
     
     def _init_weights(self):
@@ -78,10 +102,10 @@ class Downsample(nn.Module):
             if isinstance(m, nn.Linear): linear_init(m, zero_bias=True)
     
     def forward(self, x: torch.Tensor):
-        x = self.activation(self.norm1(self.pre_linear(x) + x))
+        x = self.activation(self.dropout(self.norm1(self.pre_linear(x) + x)))
 
-        output_length = math.ceil(x.size(1) / 2)
-        padding_length = 2 * (output_length - 1) + self.config.kernel_size - x.size(1)
+        output_length = math.ceil(x.size(1) / self.stride)
+        padding_length = self.stride * (output_length - 1) + self.conv.kernel_size[0] - x.size(1)
         x = torch.nn.functional.pad(x, (0, 0, 0, padding_length), "constant", 0)
 
         x = self.conv(rearrange(x, "B L D -> B D L"))
@@ -93,9 +117,11 @@ class VQEncoder(nn.Module):
         super().__init__()
 
         self.config = config
+        downsample_list = factorize(config.downsample_rate)
         self.downsample = nn.ModuleList([
-            Downsample(config) for _ in range(int(math.log2(config.downsample_rate)))
+            Downsample(config, _) for _ in downsample_list
         ])
+        
         self.post_linear = nn.Linear(config.latent_size, config.latent_size, bias=False)
     
     def _init_weights(self):
@@ -108,14 +134,16 @@ class VQEncoder(nn.Module):
         return self.post_linear(x)
 
 class Upsample(nn.Module):
-    def __init__(self, config: VQConfig):
+    def __init__(self, config: VQConfig, stride: int):
         super().__init__()
 
         self.config = config
+        self.stride = stride
         self.pre_linear = nn.Linear(config.latent_size, config.latent_size, bias=False)
         self.norm1 = RMSNorm(hidden_size=config.latent_size, eps=config.eps)
+        self.dropout = nn.Dropout(config.dropout)
         self.activation = nn.SiLU()
-        self.conv = nn.ConvTranspose1d(config.latent_size, config.latent_size, config.kernel_size, 2, bias=False)
+        self.conv = nn.ConvTranspose1d(config.latent_size, config.latent_size, max(config.kernel_size, stride), stride, bias=False)
         self.norm2 = RMSNorm(hidden_size=config.latent_size, eps=config.eps)
     
     def _init_weights(self):
@@ -123,9 +151,9 @@ class Upsample(nn.Module):
             if isinstance(m, nn.Linear): linear_init(m, zero_bias=True)
 
     def forward(self, x: torch.Tensor):
-        x = self.activation(self.norm1(self.pre_linear(x) + x))
+        x = self.activation(self.dropout(self.norm1(self.pre_linear(x) + x)))
 
-        output_length = x.size(1) * 2
+        output_length = x.size(1) * self.stride
         x = self.conv(rearrange(x, "B L D -> B D L"))
         x = rearrange(x, "B D L -> B L D")[:, :output_length]
         return self.norm2(x)
@@ -135,9 +163,11 @@ class VQDecoder(nn.Module):
         super().__init__()
 
         self.config = config
-        self.downsample = nn.ModuleList([
-            Upsample(config) for _ in range(int(math.log2(config.downsample_rate)))
+        upsample_list = factorize(config.downsample_rate)
+        self.upsample = nn.ModuleList([
+            Upsample(config, _) for _ in upsample_list
         ])
+
         self.post_linear = nn.Linear(config.latent_size, config.latent_size, bias=False)
     
     def _init_weights(self):
@@ -145,8 +175,8 @@ class VQDecoder(nn.Module):
             if isinstance(m, nn.Linear): linear_init(m, zero_bias=True)
     
     def forward(self, x: torch.Tensor):
-        for downsample in self.downsample:
-            x = downsample(x)
+        for upsample in self.upsample:
+            x = upsample(x)
         return self.post_linear(x)
 
 
@@ -162,79 +192,95 @@ class EMACache(nn.Module):
         self.value = self.decay * self.value + (1 - self.decay) * x
         return self.value / (1 - self.decay ** self.count)
 
+class PreEncoder(nn.Module):
+    def __init__(self, config: VQConfig):
+        super().__init__()
+
+        self.config = config
+        self.encoder_tower = nn.ModuleList([
+            ShortConvolution(config.latent_size, config.kernel_size) for _ in range(4)
+        ])
+        self.norm_tower = nn.ModuleList([
+            RMSNorm(hidden_size=config.latent_size, eps=config.eps) for _ in range(4)
+        ])
+    
+    def forward(self, x: torch.Tensor):
+        for encoder, norm in zip(self.encoder_tower, self.norm_tower):
+            x_new, _ = encoder(x)
+            x = norm(x_new + x)
+        return x
+
 class VQModel(PreTrainedModel):
     def __init__(self, config: VQConfig, **kwargs):
         super().__init__(config, **kwargs)
 
-        self.pre_linear = nn.Linear(config.hidden_size, config.latent_size, bias=False)
-        self.post_linear = nn.Linear(config.latent_size, config.hidden_size, bias=False)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-
-        self.base_vocab = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.codebook = nn.Embedding(config.codebook_size, config.latent_size)
+        self.config = config
+        self.num_heads = config.num_heads
+        self.lm_head = nn.Linear(config.latent_size, config.vocab_size, bias=False)
+        self.base_vocab = nn.Embedding(config.vocab_size, config.latent_size, padding_idx=config.pad_token_id)
 
         self.encoder = VQEncoder(config)
         self.decoder = VQDecoder(config)
 
-        # EMA settings
-        self.beta = config.beta
-        self.eps = config.eps
-        self.ema_cluster_size = EMACache(torch.zeros(config.codebook_size), decay=config.gamma)
-        self.ema_weight = EMACache(self.codebook.weight.clone(), decay=config.gamma)
+        # Pre-encoder
+        self.pre_encoder = PreEncoder(config)
+
+        if config.vq_type == 'optvq':
+            self.vq = OptVQ(config)
+        elif config.vq_type == 'lfq':
+            self.vq = LFQ(config)
     
     def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Linear): linear_init(m, zero_bias=True)
         
-        embedding_init(self.base_vocab)
-        embedding_init(self.codebook, distribution="uniform")
-
-    def forward(self, input_ids: torch.LongTensor):
-        x = self.pre_linear(self.base_vocab(input_ids))
+        embedding_init(self.base_vocab, distribution="uniform")
+    
+    def get_codebook(self) -> torch.Tensor:
+        return self.vq.get_codebook()
+    
+    def encode(self, input_ids: torch.LongTensor) -> Dict:
+        x = self.base_vocab(input_ids)
+        x = self.pre_encoder(x)
         x = self.encoder(x)
 
-        # codebook lookup
-        dist = torch.cdist(x, self.codebook.weight, p=2)
-        encode_idx = torch.argmin(dist, dim=-1)
-        x_encoded = self.codebook(encode_idx)
+        return self.vq(x)
+    
+    def decode(self, input_ids: torch.LongTensor):
+        x = self.vq.index_to_code(input_ids)
+        x = self.decoder(x)
+        return self.lm_head(x)
 
-        if self.training:
-            with torch.no_grad():
-                encode_idx_onehot = torch.nn.functional.one_hot(encode_idx, num_classes=self.config.codebook_size).flatten(0, 1)
-                cluster_size = encode_idx_onehot.sum(0)
-                updated_ema_cluster_size: torch.Tensor = self.ema_cluster_size(cluster_size)
+    def forward(self, input_ids: torch.LongTensor):
+        res = self.encode(input_ids)
+        x_quant, indices, aux_loss = res['quant'], res['indices'], res['aux_loss']
 
-                total_cluster_size = updated_ema_cluster_size.sum(dim=-1, keepdim=True)
-                updated_ema_cluster_size = (updated_ema_cluster_size + self.eps) * total_cluster_size / (total_cluster_size + self.config.codebook_size * self.eps)
-                new_ema_weight = encode_idx_onehot.float().transpose(0, 1) @ x.flatten(0, 1)
-                updated_ema_weight = self.ema_weight(new_ema_weight)
+        x_decoded = self.decoder(x_quant)
+        x_decoded = self.lm_head(x_decoded)
 
-                self.codebook.weight.data = updated_ema_weight / updated_ema_cluster_size.unsqueeze(-1)
+        # compute loss
+        reconstruct_ce = CrossEntropyLoss(ignore_index=self.config.pad_token_id, reduction='mean')
+        x_decoded = x_decoded[:, :input_ids.size(-1)]
+        reconstruct_loss = reconstruct_ce(x_decoded.flatten(0, 1), input_ids.flatten())
+        
+        # compute metric
+        indices_onthot = torch.nn.functional.one_hot(indices, num_classes=self.vq.codebook_size)
+        codebook_ppl = indices_onthot.flatten(0, -2).float().mean(0)
+        codebook_ppl = codebook_ppl * torch.log(codebook_ppl + self.config.eps)
+        codebook_ppl = torch.exp(-codebook_ppl.sum())
 
-            x_decoded = self.decoder(x + (x_encoded - x).detach()) # STE
-            x_decoded = self.lm_head(self.post_linear(x_decoded))
+        codebook_usage = (torch.bincount(indices.flatten(), minlength=self.vq.codebook_size) > 0).to(torch.int64)
 
-            # compute loss
-            reconstruct_ce = CrossEntropyLoss(ignore_index=self.config.pad_token_id, reduction='mean')
-            commit_mse = torch.nn.MSELoss()
+        reconstruct_acc = (torch.softmax(x_decoded, dim=-1).argmax(-1) == input_ids).logical_and(input_ids != self.config.pad_token_id).sum(-1)
+        reconstruct_acc = reconstruct_acc / (input_ids != self.config.pad_token_id).sum(-1)
+        reconstruct_acc = reconstruct_acc.mean()
 
-            l_reconstruct = reconstruct_ce(x_decoded.flatten(0, 1), input_ids.flatten())
-            l_commit = commit_mse(x.flatten(0, 1), x_encoded.flatten(0, 1).detach())
-
-            codebook_usage = (torch.bincount(encode_idx.flatten(), minlength=self.codebook.num_embeddings) > 0).sum().item() / self.codebook.num_embeddings
-            reconstruct_acc = (torch.softmax(x_decoded, dim=-1).argmax(-1) == input_ids).sum(-1) / (input_ids != self.config.pad_token_id).sum(-1)
-            reconstruct_acc = reconstruct_acc.mean()
-
-            return VQOutput(
-                loss=l_reconstruct + l_commit * self.beta,
-                reconstruct_loss=l_reconstruct,
-                reconstruct_acc=reconstruct_acc,
-                commit_loss=l_commit,
-                codebook_usage=codebook_usage
-            )
-
-        else:
-            return VQOutput(
-                codebook_emb=x_encoded,
-                codebook_idx=encode_idx
-            )
+        return VQOutput(
+            loss=reconstruct_loss + aux_loss,
+            reconstruct_loss=reconstruct_loss,
+            reconstruct_acc=reconstruct_acc,
+            commit_loss=aux_loss,
+            diversity_loss=self.vq.zero,
+            codebook_usage=codebook_usage,
+            codebook_ppl=codebook_ppl
+        )

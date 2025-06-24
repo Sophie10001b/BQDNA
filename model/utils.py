@@ -12,6 +12,7 @@ import transformers
 import lightning as pl
 
 from typing import Optional, Dict, Tuple, List, Union, Unpack, Sequence, Any
+from lightning.pytorch.strategies import FSDPStrategy, SingleDeviceStrategy, DeepSpeedStrategy, DDPStrategy, ModelParallelStrategy
 from torch.optim.lr_scheduler import LRScheduler
 from lightning.pytorch.callbacks import Callback
 from lightning.pytorch.utilities import rank_zero_only
@@ -103,11 +104,26 @@ class CheckpointCallback(Callback):
         
         self.prev_step = -1
     
-    def _safe_save(self, trainer: pl.Trainer, ckpt_path: str):
-        trainer.save_checkpoint(ckpt_path, weights_only=True)
+    def _safe_save(self, trainer: pl.Trainer, pl_module: pl.LightningModule, ckpt_path: str):
+        if trainer.num_devices > 1 and isinstance(self.trainer.strategy, ModelParallelStrategy):
+            sharded_sd = pl_module.model.state_dict()
+            state_dict = {}
+            for param_name, sharded_param in sharded_sd.items():
+                full_param = sharded_param.full_tensor()
+                if trainer.is_global_zero:
+                    state_dict[param_name] = full_param.cpu()
+                else:
+                    del full_param
+        else:
+            state_dict = pl_module.model.state_dict()
+
+        if trainer.global_rank == 0:
+            if not os.path.exists(os.path.dirname(ckpt_path)):
+                os.makedirs(os.path.dirname(ckpt_path))
+            torch.save(state_dict, ckpt_path)
     
-    def _safe_load(self, trainer: pl.Trainer, ckpt_path: str):
-        trainer.strategy.load_checkpoint(ckpt_path)
+    def _safe_load(self, trainer: pl.Trainer, pl_module: pl.LightningModule, ckpt_path: str):
+        pl_module.model.load_state_dict(torch.load(ckpt_path, map_location="cpu", weights_only=True))
 
     def _safe_eval(self, trainer: pl.Trainer, pl_module: pl.LightningModule, process_stage: Optional[RunningStage]=RunningStage.VALIDATING):
         _first_loop_iter = trainer._logger_connector._first_loop_iter
@@ -132,7 +148,7 @@ class CheckpointCallback(Callback):
         trainer._logger_connector._first_loop_iter = _first_loop_iter
     
     def save(self, ckpt_name: str | int, trainer: pl.Trainer, pl_module: pl.LightningModule, record: Optional[bool]=True):
-        self._safe_save(trainer, os.path.join(trainer.default_root_dir, f"{ckpt_name}.bin"))
+        self._safe_save(trainer, pl_module, os.path.join(trainer.default_root_dir, f"{ckpt_name}.bin"))
         metrics = convert_metrics(pl_module.eval_metrics)
         process_json(self.finetune_json_path, [{"name": str(ckpt_name), "metrics": metrics}], mode="append")
         if trainer.is_global_zero: print(f"Finish evaling at {trainer.global_step} steps, metrics: {metrics[self.core_metric]:.4f}")
@@ -194,11 +210,11 @@ class CheckpointCallback(Callback):
 
                 if i == 0:
                     ensemble_param = param
-                    for k, v in ensemble_param["state_dict"].items(): ensemble_param["state_dict"][k] = ensemble_param["state_dict"][k].float()
+                    for k, v in ensemble_param.items(): ensemble_param[k] = ensemble_param[k].float()
                 else:
-                    for k, v in ensemble_param["state_dict"].items(): ensemble_param["state_dict"][k].mul_(i).add_(param["state_dict"][k].float()).div_(i + 1)
+                    for k, v in ensemble_param.items(): ensemble_param[k].mul_(i).add_(param[k].float()).div_(i + 1)
             
-            trainer.strategy.load_model_state_dict(ensemble_param, strict=False)
+            pl_module.model.load_state_dict(ensemble_param)
             self._safe_eval(trainer, pl_module)
             self.save("Ensemble", trainer, pl_module)
         
@@ -211,7 +227,7 @@ class CheckpointCallback(Callback):
 
         # test set validation
         if self.test_in_end:
-            self._safe_load(trainer, os.path.join(trainer.default_root_dir, "final.bin"))
+            self._safe_load(trainer, pl_module, os.path.join(trainer.default_root_dir, "final.bin"))
             self._safe_eval(trainer, pl_module, RunningStage.TESTING)
             metrics = convert_metrics(pl_module.eval_metrics)
 
