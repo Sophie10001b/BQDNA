@@ -19,6 +19,7 @@ from flash_attn.losses.cross_entropy import CrossEntropyLoss
 from einops import rearrange
 from itertools import chain
 from flash_attn.bert_padding import unpad_input
+from mamba_ssm import Mamba2
 
 from .vq.configuration_vq import VQConfig
 from .vq.modeling_vq import VQModel
@@ -70,6 +71,7 @@ class FullAttention(nn.Module):
         rotary_base: int,
         dropout: float,
         layer_idx: int,
+        window: int,
         **kwargs
     ):
         super(FullAttention, self).__init__()
@@ -84,6 +86,7 @@ class FullAttention(nn.Module):
         self.qkv = nn.Linear(hidden_size, hidden_size + 2 * num_kv_heads * self.head_size, bias=False)
         self.out = nn.Linear(hidden_size, hidden_size, bias=False)
         self.rotary = RotaryEmbedding(dim=self.head_size, base=rotary_base)
+        self.window = window
 
         self._init_weights()
     
@@ -92,6 +95,10 @@ class FullAttention(nn.Module):
             if isinstance(v, nn.Linear): linear_init(v, zero_bias=True)
     
     def forward(self, x: torch.Tensor, causal: bool=False, return_attn_probs: bool=False):
+        if self.window > 0:
+            window = (self.window - 1, 0) if causal else (self.window // 2, self.window // 2)
+        else: window = (-1, -1)
+
         qkv: torch.Tensor = self.qkv(x)
         qkv = rearrange(qkv, "B L (H D) -> B L H D", H=(self.num_q_heads + 2 * self.num_kv_heads), D=self.head_size)
         q, kv = torch.split(qkv, [self.num_q_heads, 2 * self.num_kv_heads], dim=-2)
@@ -101,29 +108,36 @@ class FullAttention(nn.Module):
 
         attn_score = None
         if return_attn_probs:
-            out, _, attn_score = flash_attn_kvpacked_func(q, kv, dropout_p=self.dropout if self.training else 0, causal=causal, return_attn_probs=return_attn_probs)
+            out, _, attn_score = flash_attn_kvpacked_func(q, kv, dropout_p=self.dropout if self.training else 0, causal=causal, return_attn_probs=return_attn_probs, window_size=window)
         else:
-            out = flash_attn_kvpacked_func(q, kv, dropout_p=self.dropout if self.training else 0, causal=causal, return_attn_probs=return_attn_probs)
+            out = flash_attn_kvpacked_func(q, kv, dropout_p=self.dropout if self.training else 0, causal=causal, return_attn_probs=return_attn_probs, window_size=window)
         out = self.out(rearrange(out, "B L H D -> B L (H D)"))
         
         return out, attn_score, None
 
 class TransformerBlock(nn.Module):
-    def __init__(self, config: TransformerConfig, layer_idx: int):
+    def __init__(self, config: TransformerConfig, layer_idx: int, window: int=-1, use_mamba: bool=False):
         super().__init__()
 
         self.config = config
         self.layer_idx = layer_idx
 
         self.attn_norm = RMSNorm(hidden_size=config.hidden_size, eps=config.eps)
-        self.attn = FullAttention(
-            hidden_size=config.hidden_size,
-            num_heads=config.num_heads,
-            num_kv_heads=config.num_kv_heads,
-            rotary_base=config.rope_base,
-            dropout=config.dropout,
-            layer_idx=self.layer_idx
-        )
+        if not use_mamba:
+            self.attn = FullAttention(
+                hidden_size=config.hidden_size,
+                num_heads=config.num_heads,
+                num_kv_heads=config.num_kv_heads,
+                rotary_base=config.rope_base,
+                dropout=config.dropout,
+                layer_idx=self.layer_idx,
+                window=-1 if not config.use_mamba else window
+            )
+        else:
+            self.attn = Mamba2(
+                d_model=config.hidden_size
+            )
+
         self.ffn_norm = RMSNorm(hidden_size=config.hidden_size, eps=config.eps)
         self.ffn = GatedMlp(
             in_features=config.hidden_size,
@@ -141,7 +155,11 @@ class TransformerBlock(nn.Module):
             if isinstance(v, nn.Linear): linear_init(v, zero_bias=True)
     
     def forward(self, x: torch.Tensor, causal: bool=True, return_attn_probs: bool=False):
-        out, attn_score, past_key_values = self.attn(self.attn_norm(x), causal, return_attn_probs)
+        if isinstance(self.attn, FullAttention):
+            out, attn_score, past_key_values = self.attn(self.attn_norm(x), causal, return_attn_probs)
+        else:
+            out = self.attn(self.attn_norm(x))
+            attn_score, past_key_values = None, None
         x = x + out
         x = x + self.ffn(self.ffn_norm(x))
 
@@ -160,16 +178,23 @@ class TransformerPretraindModel(PreTrainedModel):
         if isinstance(module, nn.Linear):
             linear_init(module, zero_bias=True)
         elif isinstance(module, nn.Embedding):
-            if module.weight.requires_grad:
-                embedding_init(module, distribution="uniform")
+            embedding_init(module, distribution="uniform")
 
 class TransformerModel(TransformerPretraindModel):
-    def __init__(self, config: TransformerConfig, num_tokens: int, vq_dims: int, **kwargs):
+    def __init__(self, config: TransformerConfig, vq_config: VQConfig, vq_codebook: torch.Tensor, **kwargs):
         super().__init__(config, **kwargs)
 
-        self.layers = nn.ModuleList([TransformerBlock(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
+        if not config.use_mamba:
+            self.layers = nn.ModuleList([TransformerBlock(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
+        else:
+            self.layers = nn.ModuleList([
+                TransformerBlock(config, layer_idx, 1024, False if layer_idx % 2 == 0 else True) for layer_idx in range(config.num_hidden_layers)
+            ])
+
         self.norm = RMSNorm(config.hidden_size, eps=config.eps)
-        self.latent_project = nn.Linear(vq_dims, config.hidden_size)
+        # self.embedding = nn.Embedding(vq_config.codebook_size, config.hidden_size // vq_config.num_heads)
+        # self.split_project = nn.Linear(vq_config.latent_size // vq_config.num_heads, vq_config.latent_size)
+        self.latent_project = nn.Linear(vq_config.latent_size, config.hidden_size)
 
     def forward(
         self,
@@ -231,11 +256,11 @@ class TransformerModel(TransformerPretraindModel):
 class TransformerForMaskedLM(TransformerPretraindModel):
     _tied_weights_keys = []
 
-    def __init__(self, config: TransformerConfig, num_tokens: int, vq_dims: int):
+    def __init__(self, config: TransformerConfig, vq_config: VQConfig, vq_codebook: torch.Tensor):
         super().__init__(config)
 
-        self.model = TransformerModel(config, num_tokens, vq_dims)
-        self.lm_head = nn.Linear(config.hidden_size, num_tokens, bias=False)
+        self.model = TransformerModel(config, vq_config, vq_codebook)
+        self.lm_head = nn.Linear(config.hidden_size // vq_config.num_heads, vq_config.codebook_size + vq_config.vocab_size, bias=False)
         self.criterion = None
 
         self.post_init()
@@ -314,12 +339,15 @@ class TransformerForMaskedLM(TransformerPretraindModel):
 class TransformerForCausalLM(TransformerPretraindModel):
     _tied_weights_keys = []
 
-    def __init__(self, config: TransformerConfig, num_tokens: int, vq_dims: int):
+    def __init__(self, config: TransformerConfig, vq_config: VQConfig, vq_codebook: torch.Tensor):
         super().__init__(config)
 
-        self.model = TransformerModel(config, num_tokens, vq_dims)
-        self.lm_head = nn.Linear(config.hidden_size, num_tokens, bias=False)
+        self.model = TransformerModel(config, vq_config, vq_codebook)
+        self.lm_head = nn.Linear(config.hidden_size // vq_config.num_heads, vq_config.codebook_size + vq_config.vocab_size, bias=False)
         self.criterion = None
+
+        self.config = config
+        self.vq_config = vq_config
 
         self.post_init()
     
@@ -373,7 +401,8 @@ class TransformerForCausalLM(TransformerPretraindModel):
             **kwargs
         )
 
-        hidden_states = outputs.last_hidden_state[:, :-1].contiguous().flatten(0, 1)
+        hidden_states = outputs.last_hidden_state[:, :-1].contiguous()
+        hidden_states = rearrange(hidden_states, "B L (nH dH) -> (B L nH) dH", nH=self.vq_config.num_heads, dH=self.config.hidden_size // self.vq_config.num_heads)
         logits = self.lm_head(hidden_states)
 
         loss = None
@@ -392,10 +421,10 @@ class TransformerForCausalLM(TransformerPretraindModel):
 class TransformerForSequenceClassification(TransformerPretraindModel):
     _tied_weights_keys = []
 
-    def __init__(self, config: TransformerConfig, num_tokens: int, vq_dims: int):
+    def __init__(self, config: TransformerConfig, vq_config: VQConfig, vq_codebook: torch.Tensor):
         super().__init__(config)
 
-        self.model = TransformerModel(config, num_tokens, vq_dims)
+        self.model = TransformerModel(config, vq_config, vq_codebook)
         self.score = nn.Linear(config.hidden_size, config.num_class)
         self.criterion = None
 

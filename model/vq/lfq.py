@@ -448,11 +448,33 @@ class LFQ(Module):
 
 
 if __name__ == "__main__":
-    vq = LFQ(
-        dim=128,
-        codebook_size=16384,
-        entropy_loss_weight=0.1,
-        commitment_loss_weight=0.1
-    )
-    seq = torch.randn(16, 512, 128)
-    res = vq(seq)
+    # vq = LFQ(
+    #     dim=128,
+    #     codebook_size=16384,
+    #     entropy_loss_weight=0.1,
+    #     num_codebooks=2
+    # )
+    # seq = torch.randn(16, 512, 128)
+    # res = vq(seq)
+
+    # # INPUT:
+    # # x [batch_size, seq_len, num_heads, dim]
+    # # codebook [num_codes, dim]
+    # # OUTPUT:
+    # # sample_entropy [1]
+    # # codebook_entropy [1]
+    # dist = -2 * torch.einsum('... Q H, K H -> ... Q K', x, codebook)
+    # prob = (-dist * 100).softmax(-1)
+    # sample_entropy = (-prob * torch.clamp(prob, min=1e-5).log()).sum(-1).mean()
+
+    # batch_prob = reduce(prob, "... Q K -> Q K", "mean")
+    # codebook_entropy = (-batch_prob * torch.clamp(batch_prob, min=1e-5).log()).sum(-1).mean()
+
+    def cdist (x, y, eps=1e-5):
+        x2 = reduce(x ** 2, 'b n d -> b n', 'sum')
+        y2 = reduce(y ** 2, 'b n d -> b n', 'sum')
+        xy = einsum('b i d, b j d -> b i j', x, y) * -2
+        return (rearrange(x2, 'b i -> b i 1') + rearrange(y2, 'b j -> b 1 j') + xy).clamp(min = eps).sqrt()
+
+    a = torch.randn(1, 10, 32)
+    b = torch.randn()

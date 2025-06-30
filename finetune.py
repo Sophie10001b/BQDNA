@@ -14,6 +14,7 @@ import lightning as pl
 import swanlab
 
 from copy import deepcopy
+from einops import rearrange
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import StateDictType, FullStateDictConfig
 from torch.distributed.fsdp.wrap import wrap, enable_wrap
@@ -185,8 +186,9 @@ class PretrainModule(LightningModule):
         self.vq_config = vq_config
         self.train_config = train_config
 
-        self.vq.requires_grad_(False)
-        self.vq = self.vq.eval()
+        if not train_config.train_vq:
+            self.vq.requires_grad_(False)
+            self.vq = self.vq.eval()
 
         self._date = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
         self._train_tokens = 0
@@ -207,6 +209,7 @@ class PretrainModule(LightningModule):
         # metrics
         self.train_metrics = {
             "loss": MeanMetric().to(self.trainer.strategy.root_device),
+            "vq_loss": MeanMetric().to(self.trainer.strategy.root_device),
             "codebook_usage": MeanMetric().to(self.trainer.strategy.root_device)
         }
 
@@ -249,32 +252,37 @@ class PretrainModule(LightningModule):
         scheduler.step()
     
     def forward(self, data: Dict):
-        with torch.no_grad():
-            input_ids = data['input_ids']
-            res_dict = self.vq.encode(input_ids)
-            inputs_embeds, input_ids = res_dict['quant'], res_dict['indices']
+        input_ids = data["input_ids"]
+        # if self.train_config.train_vq:
+        #     quantized: VQOutput = self.vq(input_ids)
+        # else:
+        #     with torch.no_grad():
+        #         quantized: VQOutput = self.vq(input_ids)
 
-            codebook_usage = (torch.bincount(input_ids.flatten(), minlength=self.vq_config.codebook_size) > 0).to(torch.int64)
-            codebook_usage = codebook_usage.sum() / self.vq_config.codebook_size
+        # inputs_embeds = quantized.quant
+        # input_ids = quantized.indices
+        # codebook_usage = quantized.codebook_usage.sum() / quantized.codebook_usage.size(0)
+        self.train_metrics['codebook_usage'].update(self.vq.vq.zero)
 
-        self.train_metrics['codebook_usage'].update(codebook_usage)
-
-        bos_ids = torch.full((input_ids.size(0), 1), self.model_config.bos_token_id, dtype=torch.int64, device=self.trainer.strategy.root_device)
-        eos_ids = torch.full((input_ids.size(0), 1), self.model_config.eos_token_id, dtype=torch.int64, device=self.trainer.strategy.root_device)
-
-        inputs_embeds = torch.cat([self.vq.base_vocab(bos_ids), inputs_embeds, self.vq.base_vocab(eos_ids)], dim=1)
+        # if self.train_config.split_head:
+        #     inputs_embeds = self.model.model.split_project(rearrange(inputs_embeds, "B L (nH dH) -> B (L nH) dH", nH=self.vq_config.num_heads, dH=self.vq_config.latent_size // self.vq_config.num_heads))
+        #     inputs_embeds = torch.nn.functional.silu(inputs_embeds)
+        inputs_embeds = self.vq.base_vocab(input_ids)
         inputs_embeds = self.model.model.latent_project(inputs_embeds)
+        data['input_ids'] = input_ids
 
         outputs: SequenceClassifierOutput = self.model(
             inputs_embeds=inputs_embeds,
             labels=data["labels"]
         )
+        outputs.loss = [outputs.loss, self.vq.vq.zero]
         return outputs
     
     def training_step(self, batch: Dict, batch_idx):
         outputs: SequenceClassifierOutput = self(batch)
 
-        self.train_metrics["loss"].update(outputs.loss)
+        self.train_metrics["loss"].update(outputs.loss[0])
+        self.train_metrics["vq_loss"].update(outputs.loss[1])
         
         if batch_idx % self.trainer.accumulate_grad_batches == 0:
             loss = self.train_metrics["loss"].compute()
@@ -290,9 +298,10 @@ class PretrainModule(LightningModule):
             self.log_dict({"finetune/loss": loss, "finetune/lr": lr, "finetune/codebook_usage": codebook_usage}, prog_bar=False, logger=True)
 
             self.train_metrics["loss"].reset()
+            self.train_metrics["vq_loss"].reset()
             self.train_metrics["codebook_usage"].reset()
 
-        return outputs.loss
+        return outputs.loss[0] + outputs.loss[1] * 0.1
     
     def on_validation_epoch_start(self):
         clean_metrics(self.eval_metrics)
@@ -340,7 +349,7 @@ def main(train_config: argparse.Namespace):
     train_config.ckpt_path = os.path.join(train_config.ckpt_path, *logger_name.split('|'))
     if not os.path.exists(train_config.ckpt_path): os.makedirs(train_config.ckpt_path)
 
-    model_config = TransformerConfig()
+    model_config = TransformerConfig(use_mamba=True)
     vq_config = VQConfig(
         latent_size=train_config.latent_size,
         codebook_size=train_config.codebook_size,
@@ -387,13 +396,16 @@ def main(train_config: argparse.Namespace):
     model_config.pad_token_id = tokenizer.vocab[tokenizer.pad_token]
 
     vq = VQModel(vq_config)
-    vq_state_dict = torch.load(os.path.join(train_config.vq_path, "pytorch_model.bin"), map_location="cpu", weights_only=True)
+
+    vq_state_dict = torch.load(os.path.join(train_config.vq_path, "pytorch_model_vq.bin"), map_location="cpu", weights_only=True)
     vq.load_state_dict(vq_state_dict)
+    vq_codebook = deepcopy(vq.get_codebook())
+    vq_codebook.requires_grad_(False)
 
     datamodule = FinetuneDataModule(tokenizer, train_config)
 
     model_config.num_class = datamodule.data["train"].num_class
-    model = TransformerForSequenceClassification(model_config, tokenizer.vocab_size + vq_config.codebook_size, vq_config.latent_size)
+    model = TransformerForSequenceClassification(model_config, vq_config, vq_codebook)
     
     if train_config.max_steps == -1: train_config.max_steps = (len(datamodule.data) + raw_batch_size - 1) // raw_batch_size
 
@@ -444,6 +456,8 @@ if __name__ == "__main__":
     finetune_parser.add_argument("--downsample_rate", type=int, default=16)
     finetune_parser.add_argument("--num_heads", type=int, default=1)
     finetune_parser.add_argument("--vq_type", type=str, default="optvq")
+    finetune_parser.add_argument("--train_vq", action="store_true")
+    finetune_parser.add_argument("--split_head", action="store_true")
 
     # for ckpt callback
     finetune_parser.add_argument("--eval_start", type=int, default=200)
@@ -460,11 +474,19 @@ if __name__ == "__main__":
     args = parser.parse_args()
     # args.data_path="data/finetune/GUE"
     # args.ckpt_path="result/finetune"
-    # args.pretrain_objective="MLM"
-    # args.model_size="middle"
+    # args.logger_project="VQTransformer-finetune"
+    # args.dataset_name="GUE"
     # args.batch_size=64
     # args.max_lr=1e-4
     # args.min_lr=0
-    # args.tokenizer="ordered_kmer"
+    # args.latent_size=128
+    # args.codebook_size=16384
+    # args.downsample_rate=5
+    # args.num_heads=2
+    # args.vq_type="optvq"
+    # args.vq_path="/root/autodl-tmp/vq/result/pretrain/VQ/16384/5/optvq/2025-06-25 14:17:17"
+    # args.ensemble=False
+    # args.ensemble_only=False
+    # args.train_vq=False
 
     main(args)

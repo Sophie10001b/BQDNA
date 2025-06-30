@@ -25,7 +25,7 @@ class VQConfig(PretrainedConfig):
         commit_loss_factor: float = 0.25,
         ema_gamma: float = 0.99,
         optvq_eps: int = 10,
-        optvq_niters: int = 5,
+        optvq_niters: int = 3,
         vq_type: str = "",
         **kwargs,
     ):

@@ -27,6 +27,7 @@ class TransformerConfig(PretrainedConfig):
         num_labels: int = 1,
         num_class: int = 2,
         problem_type: str = "single_label_classification",
+        use_mamba: bool = False,
         **kwargs,
     ):
         super().__init__(
@@ -55,3 +56,4 @@ class TransformerConfig(PretrainedConfig):
         self.num_labels = num_labels
         self.num_class = num_class
         self.problem_type = problem_type
+        self.use_mamba = use_mamba

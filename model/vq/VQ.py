@@ -1,12 +1,13 @@
 import os
 import math
 import torch
-import torch.nn as nn
+import torch.distributed.nn as dist_nn
 import torch.distributed as dist
+import torch.nn as nn
 
 from functools import cache
 from typing import Sequence, Tuple, Dict, List, Any, Optional, override
-from einops import rearrange, repeat
+from einops import rearrange, repeat, reduce
 from .configuration_vq import VQConfig
 
 @cache
@@ -17,7 +18,7 @@ def maybe_distributed_mean(t: torch.Tensor):
     if not is_distributed():
         return t
 
-    dist.all_reduce(t)
+    dist_nn.all_reduce(t)
     t = t / dist.get_world_size()
     return t
 
@@ -25,10 +26,12 @@ def maybe_distributed_std(t: torch.Tensor):
     if not is_distributed():
         return torch.std(t)
     
-    t_mean = maybe_distributed_mean(t.mean())
+    t_sum = t.sum().float()
+    dist.all_reduce(t_sum)
     t_numel = torch.tensor([t.numel()], dtype=torch.int64, device=t.device)
     dist.all_reduce(t_numel)
 
+    t_mean = t_sum / t_numel
     t_sum = (t - t_mean) ** 2
     dist.all_reduce(t_sum)
 
@@ -172,18 +175,93 @@ class VQBase(nn.Module):
         raise NotImplementedError()
 
 
+class VanillaVQ(VQBase):
+    def __init__(self, config: VQConfig):
+        super().__init__(config)
+
+        self.num_heads = config.num_heads
+        self.codebook = nn.Embedding(self.codebook_size, self.codebook_dim // self.num_heads)
+        self._init_weights()
+        if self.training:
+            self.ema_cluster_size = EMACache(torch.zeros(config.codebook_size), decay=config.ema_gamma)
+            self.ema_weight = EMACache(self.codebook.weight.clone(), decay=config.ema_gamma)
+        
+        self.eps = config.eps
+    
+    def _init_weights(self):
+        embedding_init(self.codebook, distribution='uniform')
+        self.codebook.requires_grad_(False)
+    
+    @override
+    def get_codebook(self):
+        return self.codebook.weight
+
+    @override
+    def forward(self, x: torch.Tensor):
+        x_flat = rearrange(x, "B L (nH dH) -> (B L nH) dH", nH=self.num_heads, dH=self.latent_size // self.num_heads)
+        codebook = self.get_codebook()
+
+        original_dtype = x.dtype
+        with torch.autocast(device_type="cuda", enabled=False):
+            with torch.no_grad():
+                dist = torch.cdist(x_flat.float(), codebook.float(), p=2)
+                indices = dist.argmax(dim=-1)
+
+        quantized = torch.nn.functional.embedding(indices, codebook)
+
+        if self.training:
+            with torch.no_grad():
+                indices_onthot = torch.nn.functional.one_hot(indices, num_classes=self.codebook_size)
+                cluster_size = indices_onthot.sum(dim=0)
+                updated_ema_cluster_size: torch.Tensor = self.ema_cluster_size(cluster_size)
+
+                total_cluster_size = updated_ema_cluster_size.sum()
+                updated_ema_cluster_size = (updated_ema_cluster_size + self.eps) / (total_cluster_size + self.config.codebook_size * self.eps) * total_cluster_size
+                new_ema_weight = indices_onthot.float().transpose(0, 1) @ x_flat
+                updated_ema_weight = self.ema_weight(new_ema_weight)
+
+                self.codebook.weight.data = updated_ema_weight / updated_ema_cluster_size.unsqueeze(-1)
+
+            x_quant = x_flat + (quantized - x_flat).detach()
+            commit_loss = torch.nn.functional.mse_loss(x_flat, quantized.detach())
+
+            # diversity loss
+            x_entropy = rearrange(x, " B L (nH dH) -> (B L) nH dH", nH=self.num_heads, dH=self.latent_size // self.num_heads)
+            dist = -2 * (x_entropy @ codebook.t())
+            prob = (-dist * self.distance_temperature).softmax(dim=-1)
+            sample_entropy = (-prob * clamp_log(prob)).sum(-1).mean()
+
+            batch_prob = prob.mean(0)
+            batch_prob = maybe_distributed_mean(prob)
+            codebook_entropy = (-batch_prob * clamp_log(batch_prob)).sum(-1).mean()
+
+            entropy_aux_loss = sample_entropy - self.diversity_gamma * codebook_entropy
+            # entropy_aux_loss = self.zero
+        
+        else:
+            x_quant = quantized
+            commit_loss = self.zero
+            entropy_aux_loss = self.zero
+        
+        aux_loss = entropy_aux_loss * self.diversity_loss_factor + commit_loss * self.commit_loss_factor
+        return (
+            rearrange(x_quant, "(B L nH) dH -> B L (nH dH)", B=x.size(0), L=x.size(1), nH=self.num_heads, dH=self.latent_size // self.num_heads),
+            rearrange(indices, "(B L nH) -> B L nH", B=x.size(0), L=x.size(1), nH=self.num_heads),
+            aux_loss
+        )
+
 
 class OptVQ(VQBase):
     def __init__(self, config: VQConfig):
         super().__init__(config)
 
         self.num_heads = config.num_heads
-
         self.codebook = nn.Embedding(self.codebook_size, self.codebook_dim // self.num_heads)
         self._init_weights()
 
-        self.ema_cluster_size = EMACache(torch.zeros(config.codebook_size), decay=config.ema_gamma)
-        self.ema_weight = EMACache(self.codebook.weight.clone(), decay=config.ema_gamma)
+        if self.training:
+            self.ema_cluster_size = EMACache(torch.zeros(config.codebook_size), decay=config.ema_gamma)
+            self.ema_weight = EMACache(self.codebook.weight.clone(), decay=config.ema_gamma)
 
         self.eps = config.eps
         self.optvq_eps = config.optvq_eps
@@ -203,44 +281,30 @@ class OptVQ(VQBase):
         Args:
             cost (Tensor): shape with (B, K)
         """
-        distributed = is_distributed()
-        num_gpus = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
-
         Q = torch.exp(- cost * self.optvq_eps).t() # (K, B)
-        if is_distributed:
-            B = Q.size(1) * num_gpus
-        else:
-            B = Q.size(1)
+        B = Q.size(1)
         K = Q.size(0)
 
         # make the matrix sums to 1
         sum_Q = torch.sum(Q)
-        if distributed:
-            torch.distributed.all_reduce(sum_Q)
         Q /= (sum_Q + 1e-8)
 
         for _ in range(self.optvq_niters):
             # normalize each row: total weight per prototype must be 1/K
             sum_of_rows = torch.sum(Q, dim=1, keepdim=True)
-            if distributed:
-                torch.distributed.all_reduce(sum_of_rows)
-            Q /= (sum_of_rows + 1e-8)
-            Q /= K
+            Q /= (sum_of_rows * K + 1e-8 * K)
 
             # normalize each column: total weight per sample must be 1/B
-            Q /= (torch.sum(Q, dim=0, keepdim=True) + 1e-8)
-            Q /= B
+            Q /= (torch.sum(Q, dim=0, keepdim=True) * B + 1e-8 * B)
         
         Q *= B # the columns must sum to 1 so that Q is an assignment
         return Q.t() # (B, K)
     
     def get_sinkhorn_idx(self, x: torch.Tensor):
-        # x: [batch_size, seq_len, latent_size]
+        # x: [batch_size * seq_len * num_heads, codebook_size]
 
-        global_min = maybe_distributed_min(x)
-        global_std = maybe_distributed_std(x)
-        cost = (x - global_min) / (global_std + self.eps)
-        cost = cost - maybe_distributed_min(cost)
+        cost = (x - x.mean()) / (x.std() + self.eps)
+        cost = cost - cost.min()
 
         indices = self.sinkhorn(cost)
         indices = indices.argmax(dim=-1)
@@ -251,11 +315,10 @@ class OptVQ(VQBase):
     def forward(self, x: torch.Tensor):
         x_flat = rearrange(x, "B L (nH dH) -> (B L nH) dH", nH=self.num_heads, dH=self.latent_size // self.num_heads)
 
-        original_dtype = x.dtype
         with torch.autocast(device_type="cuda", enabled=False):
+            dist = torch.cdist(x_flat.float(), self.get_codebook().float(), p=2)
             with torch.no_grad():
-                dist = torch.cdist(x_flat.float(), self.get_codebook().float(), p=2)
-                indices = self.get_sinkhorn_idx(dist)
+                indices = self.get_sinkhorn_idx(dist.float())
 
         quantized = self.index_to_code(indices)
 
@@ -277,15 +340,19 @@ class OptVQ(VQBase):
             commit_loss = torch.nn.functional.mse_loss(x_flat, quantized.detach())
 
             # diversity loss
-            x_multihead = rearrange(x, "B L (nH dH) -> B (L nH) dH", nH=self.num_heads, dH=self.latent_size // self.num_heads)
-            codebook = self.get_codebook()
-            dist = -2 * (x_multihead @ codebook.transpose(-1, -2))
-            prob = (-dist * self.distance_temperature).softmax(dim=-1)
+            with torch.autocast(device_type="cuda", enabled=False):
+                # compute loss
+                codebook = self.get_codebook().float()
+                x_entropy = rearrange(x, "B L (nH dH) -> (B L) nH dH", nH=self.num_heads, dH=self.latent_size // self.num_heads).float()
+                dist = -2 * torch.einsum('... i d, j d -> ... i j', x_entropy, codebook)
+                prob = (-dist * self.distance_temperature).softmax(dim=-1)
+                sample_entropy = (-prob * clamp_log(prob)).sum(-1).mean()
 
-            sample_entropy = (-prob * clamp_log(prob)).sum(-1).mean()
-            batch_prob = maybe_distributed_mean(prob.mean(dim=0))
-            codebook_entropy = (-batch_prob * clamp_log(batch_prob)).sum(-1).mean()
-            entropy_aux_loss = sample_entropy - self.diversity_gamma * codebook_entropy
+                batch_prob = reduce(prob, '... c d -> c d', 'mean')
+                batch_prob = maybe_distributed_mean(batch_prob)
+                codebook_entropy = (-batch_prob * clamp_log(batch_prob)).sum(-1).mean()
+
+                entropy_aux_loss = sample_entropy - self.diversity_gamma * codebook_entropy
         
         else:
             x_quant = quantized
@@ -293,26 +360,27 @@ class OptVQ(VQBase):
             entropy_aux_loss = self.zero
         
         aux_loss = entropy_aux_loss * self.diversity_loss_factor + commit_loss * self.commit_loss_factor
-        return dict(
-            quant=rearrange(x_quant, "(B L nH) dH -> B L (nH dH)", B=x.size(0), L=x.size(1), nH=self.num_heads, dH=self.latent_size // self.num_heads),
-            indices=rearrange(indices, "(B L nH) -> B L nH", B=x.size(0), L=x.size(1), nH=self.num_heads),
-            aux_loss=aux_loss
+        return (
+            rearrange(x_quant, "(B L nH) dH -> B L (nH dH)", B=x.size(0), L=x.size(1), nH=self.num_heads, dH=self.latent_size // self.num_heads),
+            rearrange(indices, "(B L nH) -> B L nH", B=x.size(0), L=x.size(1), nH=self.num_heads),
+            aux_loss
         )
 
 
 class LFQ(VQBase):
     def __init__(self, config: VQConfig):
         super().__init__(config)
-
+        
+        self.num_heads = config.num_heads
         self.codebook_dim = int(math.log2(self.codebook_size))
 
-        self.downsample = nn.Linear(self.latent_size, self.codebook_dim)
-        self.upsample = nn.Linear(self.codebook_dim, self.latent_size)
+        self.downsample = nn.Linear(self.latent_size, self.codebook_dim * self.num_heads)
+        self.upsample = nn.Linear(self.codebook_dim * self.num_heads, self.latent_size)
 
         # get codebook
-        self.register_buffer('mask', torch.arange(self.codebook_dim - 1, -1, -1) ** 2, persistent=False)
+        self.register_buffer('mask', 2 ** torch.arange(self.codebook_dim - 1, -1, -1), persistent=False)
         bits = ((torch.arange(self.codebook_size)[:, None].int() & self.mask) != 0).float()
-        self.register_buffer('codebook', bits * 2 - 1, persistent=False)
+        self.register_buffer('codebook', torch.nn.functional.normalize(bits * 2 - 1, dim=-1), persistent=False)
 
         self._init_weights()
     
@@ -328,12 +396,17 @@ class LFQ(VQBase):
     def forward(self, x: torch.Tensor):
         x = self.downsample(x)
 
+        batch_size = x.size(0)
+        seq_len = x.size(1)
+        x = rearrange(x, "B L (nH dH) -> B L nH dH", nH=self.num_heads, dH=self.codebook_dim)
+
         original_dtype = x.dtype
         with torch.autocast(device_type="cuda", enabled=False):
-            x = x.float()
+            x = torch.nn.functional.normalize(x.float(), dim=-1)
             codebook_val = torch.ones_like(x)
             quantized = torch.where(x > 0, codebook_val, -codebook_val)
             indices = ((quantized > 0).to(torch.int64) * self.mask.to(torch.int64)).sum(-1)
+            quantized = torch.nn.functional.normalize(quantized, dim=-1)
 
         x = x.to(original_dtype)
 
@@ -342,33 +415,92 @@ class LFQ(VQBase):
             codebook = self.codebook.float()
 
             # compute loss
-            dist = -2 * (x @ codebook.transpose(-1, -2))
+            x_entropy = rearrange(x, " B L nH dH -> (B L) nH dH").float()
+            dist = -2 * torch.einsum('... i d, j d -> ... i j', x_entropy, codebook)
             prob = (-dist * self.distance_temperature).softmax(dim=-1)
-
             sample_entropy = (-prob * clamp_log(prob)).sum(-1).mean()
-            batch_prob = maybe_distributed_mean(prob.mean(dim=0))
+
+            batch_prob = reduce(prob, '... c d -> c d', 'mean')
+            batch_prob = maybe_distributed_mean(batch_prob)
             codebook_entropy = (-batch_prob * clamp_log(batch_prob)).sum(-1).mean()
 
             entropy_aux_loss = sample_entropy - self.diversity_gamma * codebook_entropy
             # commit_loss = torch.nn.functional.mse_loss(x, quantized.detach())
+            commit_loss = self.zero
         
         else:
             x_quant = quantized
             entropy_aux_loss = self.zero
             commit_loss = self.zero
 
+        x_quant = rearrange(x_quant, "B L nH dH -> B L (nH dH)")
         x_quant = self.upsample(x_quant)
-        aux_loss = entropy_aux_loss * self.diversity_loss_factor
+        aux_loss = entropy_aux_loss * self.diversity_loss_factor + commit_loss * self.commit_loss_factor
 
-        return dict(
-            quant=x_quant,
-            indices=indices,
-            aux_loss=aux_loss
+        return (x_quant, indices, aux_loss)
+
+class IBQ(VQBase):
+    def __init__(self, config: VQConfig):
+        super().__init__(config)
+
+        self.num_heads = config.num_heads
+
+        self.codebook = nn.Embedding(self.codebook_size, self.codebook_dim // self.num_heads)
+        self._init_weights()
+        self.eps = config.eps
+    
+    def _init_weights(self):
+        embedding_init(self.codebook, distribution='uniform')
+    
+    @override
+    def get_codebook(self):
+        return self.codebook.weight
+    
+    @override
+    def forward(self, x: torch.Tensor):
+        x_flat = rearrange(x, "B L (nH dH) -> (B L nH) dH", nH=self.num_heads, dH=self.latent_size // self.num_heads)
+
+        logits = x_flat @ self.get_codebook().t()
+        indices = logits.argmax(dim=-1)
+
+        if self.training:
+            soft_onehot = logits.softmax(dim=-1)
+            hard_onehot = torch.zeros_like(logits).scatter_(-1, indices.unsqueeze(-1), 1.0)
+            onehot = hard_onehot - soft_onehot.detach() + soft_onehot
+
+            quantized = onehot @ self.get_codebook()
+            x_quant = x_flat + (quantized - x_flat).detach()
+            quantized_hard = hard_onehot @ self.get_codebook()
+            commit_loss = torch.nn.functional.mse_loss(x_flat, quantized) + torch.nn.functional.mse_loss(x_flat, quantized_hard.detach()) * self.commit_loss_factor + torch.nn.functional.mse_loss(quantized_hard, x_flat.detach())
+
+            # diversity loss
+            x_entropy = rearrange(logits, " (B L nH) K -> (B L) nH K", B=x.size(0), L=x.size(1), nH=self.num_heads)
+            prob = (x_entropy * self.distance_temperature).softmax(dim=-1)
+            sample_entropy = (-prob * clamp_log(prob)).sum(-1).mean()
+
+            batch_prob = prob.mean(0)
+            # batch_prob = maybe_distributed_mean(prob)
+            codebook_entropy = (-batch_prob * clamp_log(batch_prob)).sum(-1).mean()
+
+            entropy_aux_loss = sample_entropy - self.diversity_gamma * codebook_entropy
+            # entropy_aux_loss = self.zero
+        
+        else:
+            x_quant = self.index_to_code(indices)
+            commit_loss = self.zero
+            entropy_aux_loss = self.zero
+        
+        aux_loss = entropy_aux_loss * self.diversity_loss_factor + commit_loss
+        return (
+            rearrange(x_quant, "(B L nH) dH -> B L (nH dH)", B=x.size(0), L=x.size(1), nH=self.num_heads, dH=self.latent_size // self.num_heads),
+            rearrange(indices, "(B L nH) -> B L nH", B=x.size(0), L=x.size(1), nH=self.num_heads),
+            aux_loss
         )
+
 
 if __name__ == '__main__':
     config = VQConfig(latent_size=128, downsample_rate=5, codebook_size=16384)
-    vq = LFQ(config)
+    vq = OptVQ(config)
 
-    seq = torch.randn(16, 512, 128)
+    seq = torch.randn(2, 32, 128)
     res = vq(seq)

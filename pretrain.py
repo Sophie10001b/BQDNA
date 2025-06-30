@@ -15,6 +15,7 @@ import lightning as pl
 import swanlab
 
 from copy import deepcopy
+from einops import rearrange
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import StateDictType, FullStateDictConfig
 from torch.distributed.fsdp.wrap import wrap, enable_wrap
@@ -150,8 +151,9 @@ class PretrainModule(LightningModule):
         self.vq_config = vq_config
         self.train_config = train_config
 
-        self.vq.requires_grad_(False)
-        self.vq = self.vq.eval()
+        if not train_config.train_vq:
+            self.vq.requires_grad_(False)
+            self.vq = self.vq.eval()
 
         self._date = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
         self._train_tokens = 0
@@ -178,6 +180,7 @@ class PretrainModule(LightningModule):
         # metrics
         self.train_metrics = {
             "loss": MeanMetric().to(self.trainer.strategy.root_device),
+            "vq_loss": MeanMetric().to(self.trainer.strategy.root_device),
             "batch_size": SumMetric().to(self.trainer.strategy.root_device),
             "train_tokens": SumMetric().to(self.trainer.strategy.root_device),
             "codebook_usage": MeanMetric().to(self.trainer.strategy.root_device),
@@ -197,16 +200,16 @@ class PretrainModule(LightningModule):
         if self.trainer.is_global_zero:
             ckpt = torch.load(os.path.join(self.train_config.ckpt_path, self._date, "pytorch_model.bin"), map_location='cpu', weights_only=True)["state_dict"]
             cache = {}
+            vq_cache = {}
             for k, v in ckpt.items():
                 head = k.split(".")[0]
-                if head == "vq": continue
                 new_k = k.split(".")[1:]
                 new_k = ".".join(new_k)
-                cache[new_k] = v
-            ckpt = cache
-            torch.save(ckpt, os.path.join(self.train_config.ckpt_path, self._date, "pytorch_model.bin"))
+                if head == "vq": vq_cache[new_k] = v
+                else: cache[new_k] = v
+            torch.save(cache, os.path.join(self.train_config.ckpt_path, self._date, "pytorch_model.bin"))
+            torch.save(vq_cache, os.path.join(self.train_config.ckpt_path, self._date, "pytorch_model_vq.bin"))
         
-
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(
             self.parameters(),
@@ -233,32 +236,33 @@ class PretrainModule(LightningModule):
             self.vq = vq_parallelize_setting(self.vq, self.device_mesh)
     
     def forward(self, data: Dict):
-        with torch.no_grad():
-            input_ids = data['input_ids']
-            inputs_embeds, input_ids, _ = self.vq.encode(input_ids)
-            codebook_usage = (torch.bincount(input_ids.flatten(), minlength=self.vq_config.codebook_size) > 0).to(torch.int64)
-            codebook_usage = codebook_usage.sum() / self.vq_config.codebook_size
+        input_ids = data["input_ids"]
+        if self.train_config.train_vq:
+            quantized: VQOutput = self.vq(input_ids)
+        else:
+            with torch.no_grad():
+                quantized: VQOutput = self.vq(input_ids)
 
+        inputs_embeds = quantized.quant
+        input_ids = quantized.indices
+        codebook_usage = quantized.codebook_usage.sum() / quantized.codebook_usage.size(0)
         self.train_metrics['codebook_usage'].update(codebook_usage)
 
-        bos_ids = torch.full((input_ids.size(0), 1), self.model_config.bos_token_id, dtype=torch.int64, device=self.trainer.strategy.root_device)
-        eos_ids = torch.full((input_ids.size(0), 1), self.model_config.eos_token_id, dtype=torch.int64, device=self.trainer.strategy.root_device)
-        input_ids = torch.cat([bos_ids, input_ids + self.vq.base_vocab.num_embeddings, eos_ids], dim=-1)
-
-        inputs_embeds = torch.cat([self.vq.base_vocab(bos_ids), inputs_embeds, self.vq.base_vocab(eos_ids)], dim=1)
         inputs_embeds = self.model.model.latent_project(inputs_embeds)
-
         data['input_ids'] = input_ids
+
         outputs: SequenceClassifierOutput = self.model(
             inputs_embeds=inputs_embeds,
-            labels=data['input_ids']
+            labels=data["input_ids"]
         )
+        outputs.loss = [outputs.loss, quantized.loss]
         return outputs
     
     def training_step(self, batch: Dict, batch_idx):
         outputs: VQOutput = self(batch)
 
-        self.train_metrics["loss"].update(outputs.loss)
+        self.train_metrics["loss"].update(outputs.loss[0])
+        self.train_metrics["vq_loss"].update(outputs.loss[1])
         self.train_metrics["batch_size"].update(batch["input_ids"].size(0))
         self.train_metrics["train_tokens"].update(batch["input_ids"].size(0) * batch["input_ids"].size(1))
         
@@ -278,9 +282,10 @@ class PretrainModule(LightningModule):
             self.log("pretrain/lr", lr, prog_bar=False)
 
             self.train_metrics["loss"].reset()
+            self.train_metrics["vq_loss"].reset()
             self.train_metrics["batch_size"].reset()
 
-        return outputs.loss
+        return outputs.loss[0] + outputs.loss[1]
 
 def main(train_config: argparse.Namespace):
     pl.seed_everything(train_config.seed)
@@ -345,15 +350,19 @@ def main(train_config: argparse.Namespace):
 
     tokenizer: AutoTokenizer = AutoTokenizer.from_pretrained(os.path.join(base_path, "tokenizer/base"), use_fast=True, trust_remote_code=True, local_files_only=True)
     model_config.vocab_size = tokenizer.vocab_size
+    vq_config.vocab_size = tokenizer.vocab_size
     model_config.bos_token_id = tokenizer.vocab[tokenizer.bos_token]
     model_config.eos_token_id = tokenizer.vocab[tokenizer.eos_token]
     model_config.pad_token_id = tokenizer.vocab[tokenizer.pad_token]
 
     vq = VQModel(vq_config)
-    vq_state_dict = torch.load(os.path.join(train_config.vq_path, "pytorch_model.bin"), map_location="cpu", weights_only=True)
-    vq.load_state_dict(vq_state_dict)
 
-    model = TransformerForCausalLM(model_config, tokenizer.vocab_size + vq_config.codebook_size, vq_config.latent_size)
+    vq_state_dict = torch.load(os.path.join(train_config.vq_path, "pytorch_model_vq.bin"), map_location="cpu", weights_only=True)
+    vq.load_state_dict(vq_state_dict)
+    vq_codebook = deepcopy(vq.get_codebook())
+    vq_codebook.requires_grad_(False)
+
+    model = TransformerForCausalLM(model_config, vq_config, vq_codebook)
     datamodule = PretrainDataModule(tokenizer, model_config, train_config)
 
     if train_config.max_epochs != -1:
@@ -396,18 +405,18 @@ if __name__ == "__main__":
     pretrain_parser.add_argument("--downsample_rate", type=int, default=16)
     pretrain_parser.add_argument("--num_heads", type=int, default=1)
     pretrain_parser.add_argument("--vq_type", type=str, default="optvq")
+    pretrain_parser.add_argument("--train_vq", action="store_true")
 
     args = parser.parse_args()
     # args.data_path="data/pretrain"
     # args.ckpt_path="result/pretrain"
-    # args.vq_path="/root/autodl-tmp/vq/result/pretrain/Pretrain/VQ/8192/16/2025-05-28 20:29:30/pytorch_model.bin"
-    # args.max_seqlen=16384
-    # args.max_token_per_batch=1048576 * 2
+    # args.vq_path="/root/autodl-tmp/vq/result/pretrain/VQ/16384/5/optvq/2025-06-25 14:17:17"
+    # args.batch_size = 16
     # args.accumulate_grad_batches=1
-    # args.num_preprocess_workers=48
-    # args.latent_size=256
-    # args.codebook_size=8192
-    # args.downsample_rate=16
+    # args.num_preprocess_workers=20
+    # args.latent_size=128
+    # args.codebook_size=16384
+    # args.downsample_rate=5
+    # args.num_heads=2
     # args.vq_type="optvq"
-    # args.max_steps=100
     main(args)

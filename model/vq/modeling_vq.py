@@ -19,7 +19,8 @@ from dataclasses import dataclass
 from fla.modules import ShortConvolution
 
 from .configuration_vq import VQConfig
-from .VQ import LFQ, OptVQ
+from .VQ import OptVQ, LFQ, VanillaVQ, IBQ
+# from .lfq import LFQ
 from transformers.modeling_utils import PreTrainedModel
 
 @torch.no_grad()
@@ -72,6 +73,8 @@ def factorize(num: int):
 
 @dataclass
 class VQOutput(ModelOutput):
+    quant: Optional[torch.Tensor] = None
+    indices: Optional[torch.LongTensor] = None
     loss: Optional[torch.Tensor] = None
     reconstruct_loss: Optional[torch.Tensor] = None
     reconstruct_acc: Optional[torch.Tensor] = None
@@ -92,7 +95,6 @@ class Downsample(nn.Module):
         self.stride = stride
         self.pre_linear = nn.Linear(config.latent_size, config.latent_size, bias=False)
         self.norm1 = RMSNorm(hidden_size=config.latent_size, eps=config.eps)
-        self.dropout = nn.Dropout(config.dropout)
         self.activation = nn.SiLU()
         self.conv = nn.Conv1d(config.latent_size, config.latent_size, max(config.kernel_size, stride), stride, bias=False)
         self.norm2 = RMSNorm(hidden_size=config.latent_size, eps=config.eps)
@@ -102,7 +104,7 @@ class Downsample(nn.Module):
             if isinstance(m, nn.Linear): linear_init(m, zero_bias=True)
     
     def forward(self, x: torch.Tensor):
-        x = self.activation(self.dropout(self.norm1(self.pre_linear(x) + x)))
+        x = self.activation(self.norm1(self.pre_linear(x) + x))
 
         output_length = math.ceil(x.size(1) / self.stride)
         padding_length = self.stride * (output_length - 1) + self.conv.kernel_size[0] - x.size(1)
@@ -141,7 +143,6 @@ class Upsample(nn.Module):
         self.stride = stride
         self.pre_linear = nn.Linear(config.latent_size, config.latent_size, bias=False)
         self.norm1 = RMSNorm(hidden_size=config.latent_size, eps=config.eps)
-        self.dropout = nn.Dropout(config.dropout)
         self.activation = nn.SiLU()
         self.conv = nn.ConvTranspose1d(config.latent_size, config.latent_size, max(config.kernel_size, stride), stride, bias=False)
         self.norm2 = RMSNorm(hidden_size=config.latent_size, eps=config.eps)
@@ -151,7 +152,7 @@ class Upsample(nn.Module):
             if isinstance(m, nn.Linear): linear_init(m, zero_bias=True)
 
     def forward(self, x: torch.Tensor):
-        x = self.activation(self.dropout(self.norm1(self.pre_linear(x) + x)))
+        x = self.activation(self.norm1(self.pre_linear(x) + x))
 
         output_length = x.size(1) * self.stride
         x = self.conv(rearrange(x, "B L D -> B D L"))
@@ -207,6 +208,7 @@ class PreEncoder(nn.Module):
     def forward(self, x: torch.Tensor):
         for encoder, norm in zip(self.encoder_tower, self.norm_tower):
             x_new, _ = encoder(x)
+            x_new = torch.nn.functional.dropout(x_new, p=self.config.dropout, training=self.training)
             x = norm(x_new + x)
         return x
 
@@ -219,6 +221,9 @@ class VQModel(PreTrainedModel):
         self.lm_head = nn.Linear(config.latent_size, config.vocab_size, bias=False)
         self.base_vocab = nn.Embedding(config.vocab_size, config.latent_size, padding_idx=config.pad_token_id)
 
+        # self.project_in = nn.Linear(config.hidden_size, config.latent_size)
+        # self.project_out = nn.Linear(config.latent_size, config.hidden_size)
+
         self.encoder = VQEncoder(config)
         self.decoder = VQDecoder(config)
 
@@ -229,6 +234,16 @@ class VQModel(PreTrainedModel):
             self.vq = OptVQ(config)
         elif config.vq_type == 'lfq':
             self.vq = LFQ(config)
+            # self.vq = LFQ(
+            #     dim=config.latent_size,
+            #     codebook_size=config.codebook_size,
+            #     entropy_loss_weight=config.diversity_loss_factor,
+            #     num_codebooks=config.num_heads
+            # )
+        elif config.vq_type == 'vanillavq':
+            self.vq = VanillaVQ(config)
+        elif config.vq_type == "ibq":
+            self.vq = IBQ(config)
     
     def _init_weights(self):
         for m in self.modules():
@@ -241,28 +256,28 @@ class VQModel(PreTrainedModel):
     
     def encode(self, input_ids: torch.LongTensor) -> Dict:
         x = self.base_vocab(input_ids)
+        # x = self.project_in(x)
         x = self.pre_encoder(x)
         x = self.encoder(x)
 
-        return self.vq(x)
+        res = self.vq(x)
+
+        return dict(
+            quant=res[0],
+            indices=res[1],
+            aux_loss=res[2]
+        )
     
     def decode(self, input_ids: torch.LongTensor):
         x = self.vq.index_to_code(input_ids)
         x = self.decoder(x)
+        # x = self.project_out(x)
         return self.lm_head(x)
 
     def forward(self, input_ids: torch.LongTensor):
         res = self.encode(input_ids)
         x_quant, indices, aux_loss = res['quant'], res['indices'], res['aux_loss']
 
-        x_decoded = self.decoder(x_quant)
-        x_decoded = self.lm_head(x_decoded)
-
-        # compute loss
-        reconstruct_ce = CrossEntropyLoss(ignore_index=self.config.pad_token_id, reduction='mean')
-        x_decoded = x_decoded[:, :input_ids.size(-1)]
-        reconstruct_loss = reconstruct_ce(x_decoded.flatten(0, 1), input_ids.flatten())
-        
         # compute metric
         indices_onthot = torch.nn.functional.one_hot(indices, num_classes=self.vq.codebook_size)
         codebook_ppl = indices_onthot.flatten(0, -2).float().mean(0)
@@ -271,12 +286,29 @@ class VQModel(PreTrainedModel):
 
         codebook_usage = (torch.bincount(indices.flatten(), minlength=self.vq.codebook_size) > 0).to(torch.int64)
 
-        reconstruct_acc = (torch.softmax(x_decoded, dim=-1).argmax(-1) == input_ids).logical_and(input_ids != self.config.pad_token_id).sum(-1)
-        reconstruct_acc = reconstruct_acc / (input_ids != self.config.pad_token_id).sum(-1)
-        reconstruct_acc = reconstruct_acc.mean()
+        if self.training:
+            x_decoded = self.decoder(x_quant)
+            # x_decoded = self.project_out(x_decoded)
+            x_decoded = self.lm_head(x_decoded)
+
+            # compute loss
+            reconstruct_ce = CrossEntropyLoss(ignore_index=self.config.pad_token_id, reduction='mean')
+            x_decoded = x_decoded[:, :input_ids.size(-1)]
+            reconstruct_loss = reconstruct_ce(x_decoded.flatten(0, 1), input_ids.flatten())
+
+            reconstruct_acc = (torch.softmax(x_decoded, dim=-1).argmax(-1) == input_ids).logical_and(input_ids != self.config.pad_token_id).sum(-1)
+            reconstruct_acc = reconstruct_acc / (input_ids != self.config.pad_token_id).sum(-1)
+            reconstruct_acc = reconstruct_acc.mean()
+            loss = reconstruct_loss + aux_loss
+        else:
+            reconstruct_loss = self.vq.zero
+            reconstruct_acc = self.vq.zero
+            loss = self.vq.zero
 
         return VQOutput(
-            loss=reconstruct_loss + aux_loss,
+            quant=x_quant,
+            indices=indices,
+            loss=loss,
             reconstruct_loss=reconstruct_loss,
             reconstruct_acc=reconstruct_acc,
             commit_loss=aux_loss,

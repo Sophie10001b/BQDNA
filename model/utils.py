@@ -106,7 +106,7 @@ class CheckpointCallback(Callback):
     
     def _safe_save(self, trainer: pl.Trainer, pl_module: pl.LightningModule, ckpt_path: str):
         if trainer.num_devices > 1 and isinstance(self.trainer.strategy, ModelParallelStrategy):
-            sharded_sd = pl_module.model.state_dict()
+            sharded_sd = pl_module.state_dict()
             state_dict = {}
             for param_name, sharded_param in sharded_sd.items():
                 full_param = sharded_param.full_tensor()
@@ -115,7 +115,7 @@ class CheckpointCallback(Callback):
                 else:
                     del full_param
         else:
-            state_dict = pl_module.model.state_dict()
+            state_dict = pl_module.state_dict()
 
         if trainer.global_rank == 0:
             if not os.path.exists(os.path.dirname(ckpt_path)):
@@ -123,7 +123,7 @@ class CheckpointCallback(Callback):
             torch.save(state_dict, ckpt_path)
     
     def _safe_load(self, trainer: pl.Trainer, pl_module: pl.LightningModule, ckpt_path: str):
-        pl_module.model.load_state_dict(torch.load(ckpt_path, map_location="cpu", weights_only=True))
+        pl_module.load_state_dict(torch.load(ckpt_path, map_location="cpu", weights_only=True))
 
     def _safe_eval(self, trainer: pl.Trainer, pl_module: pl.LightningModule, process_stage: Optional[RunningStage]=RunningStage.VALIDATING):
         _first_loop_iter = trainer._logger_connector._first_loop_iter
@@ -214,7 +214,7 @@ class CheckpointCallback(Callback):
                 else:
                     for k, v in ensemble_param.items(): ensemble_param[k].mul_(i).add_(param[k].float()).div_(i + 1)
             
-            pl_module.model.load_state_dict(ensemble_param)
+            pl_module.load_state_dict(ensemble_param)
             self._safe_eval(trainer, pl_module)
             self.save("Ensemble", trainer, pl_module)
         
